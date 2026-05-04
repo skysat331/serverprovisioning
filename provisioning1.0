@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+EMAIL="skysat331@gmail.com"
+SSHD_CONFIG="/etc/ssh/sshd_config"
+UFW_DEFAULT="/etc/default/ufw"
+UFW_BEFORE="/etc/ufw/before.rules"
+
+log() {
+  echo -e "\n[+] $*"
+}
+
+warn() {
+  echo -e "\n[!] $*" >&2
+}
+
+die() {
+  echo -e "\n[ERROR] $*" >&2
+  exit 1
+}
+
+require_root() {
+  [[ "${EUID}" -eq 0 ]] || die "Запусти скрипт через sudo."
+}
+
+backup_file() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  cp -a "$file" "${file}.bak.$(date +%F-%H%M%S)"
+}
+
+prompt_yes_no() {
+  local prompt="$1"
+  local answer
+  while true; do
+    read -r -p "$prompt [y/n]: " answer
+    case "${answer,,}" in
+      y|yes) return 0 ;;
+      n|no) return 1 ;;
+      *) echo "Введите y или n" ;;
+    esac
+  done
+}
+
+prompt_ssh_port() {
+  local port
+  while true; do
+    read -r -p "Введите новый SSH порт: " port
+    [[ "$port" =~ ^[0-9]+$ ]] || { echo "Порт должен быть числом"; continue; }
+    (( port >= 1 && port <= 65535 )) || { echo "Порт должен быть в диапазоне 1-65535"; continue; }
+    [[ "$port" != "22" ]] || warn "Оставляешь 22, это допустимо, но смысл переноса пропадает."
+    SSH_PORT="$port"
+    return 0
+  done
+}
+
+check_authorized_keys() {
+  local user_home auth_file found=0
+
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    user_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    auth_file="${user_home}/.ssh/authorized_keys"
+    if [[ -s "$auth_file" ]]; then
+      log "Найден authorized_keys у пользователя ${SUDO_USER}: ${auth_file}"
+      found=1
+    fi
+  fi
+
+  if [[ -s "/root/.ssh/authorized_keys" ]]; then
+    log "Найден authorized_keys у root: /root/.ssh/authorized_keys"
+    found=1
+  fi
+
+  (( found == 1 )) || die "Не найден ни один непустой authorized_keys. Сначала добавь SSH-ключ на VPS."
+}
+
+apt_update_upgrade() {
+  log "Обновляю пакеты"
+  apt update
+  DEBIAN_FRONTEND=noninteractive apt -y upgrade
+}
+
+install_base_utils() {
+  log "Ставлю базовые утилиты"
+  apt install -y vim nano curl htop unzip gnupg ufw lsb-release ca-certificates apt-transport-https software-properties-common
+}
+
+install_docker_official() {
+  log "Удаляю возможные конфликтующие docker-пакеты"
+  apt remove -y docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc || true
+
+  log "Добавляю официальный Docker репозиторий"
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  chmod a+r /etc/apt/keyrings/docker.asc
+
+  cat >/etc/apt/sources.list.d/docker.sources <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+
+  apt update
+  log "Ставлю Docker Engine"
+  apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  systemctl enable docker
+  systemctl restart docker
+  docker --version || die "Docker не установился корректно"
+}
+
+install_nginx_optional() {
+  if prompt_yes_no "Установить nginx + stream + certbot?"; then
+    log "Ставлю nginx и certbot"
+    apt install -y nginx libnginx-mod-stream certbot python3-certbot-nginx
+    certbot register --non-interactive --agree-tos --email "$EMAIL" || warn "Certbot register завершился с ошибкой, проверь вручную."
+    systemctl enable nginx
+    systemctl restart nginx
+  else
+    log "Пропускаю nginx"
+  fi
+}
+
+install_iperf3() {
+  log "Ставлю iperf3"
+  apt install -y iperf3
+}
+
+configure_ufw_ipv6() {
+  log "Выключаю IPv6 в UFW"
+  backup_file "$UFW_DEFAULT"
+  sed -i 's/^IPV6=.*/IPV6=no/' "$UFW_DEFAULT"
+}
+
+configure_ssh() {
+  backup_file "$SSHD_CONFIG"
+
+  if grep -qE '^[#[:space:]]*Port[[:space:]]+' "$SSHD_CONFIG"; then
+    sed -i "s/^[#[:space:]]*Port[[:space:]].*/Port ${SSH_PORT}/" "$SSHD_CONFIG"
+  else
+    echo "Port ${SSH_PORT}" >> "$SSHD_CONFIG"
+  fi
+
+  if grep -qE '^[#[:space:]]*PasswordAuthentication[[:space:]]+' "$SSHD_CONFIG"; then
+    sed -i 's/^[#[:space:]]*PasswordAuthentication[[:space:]].*/PasswordAuthentication no/' "$SSHD_CONFIG"
+  else
+    echo 'PasswordAuthentication no' >> "$SSHD_CONFIG"
+  fi
+
+  if grep -qE '^[#[:space:]]*PubkeyAuthentication[[:space:]]+' "$SSHD_CONFIG"; then
+    sed -i 's/^[#[:space:]]*PubkeyAuthentication[[:space:]].*/PubkeyAuthentication yes/' "$SSHD_CONFIG"
+  else
+    echo 'PubkeyAuthentication yes' >> "$SSHD_CONFIG"
+  fi
+
+  if grep -qE '^[#[:space:]]*KbdInteractiveAuthentication[[:space:]]+' "$SSHD_CONFIG"; then
+    sed -i 's/^[#[:space:]]*KbdInteractiveAuthentication[[:space:]].*/KbdInteractiveAuthentication no/' "$SSHD_CONFIG"
+  else
+    echo 'KbdInteractiveAuthentication no' >> "$SSHD_CONFIG"
+  fi
+
+  sshd -t || die "Проверка sshd_config не прошла"
+  systemctl reload ssh
+  systemctl daemon-reload
+  systemctl restart ssh
+}
+
+configure_ufw_rules() {
+  log "Настраиваю UFW правила"
+
+  ufw --force reset
+  ufw default deny incoming
+  ufw default allow outgoing
+
+  ufw allow "${SSH_PORT}/tcp"
+  ufw limit "${SSH_PORT}/tcp"
+
+  if [[ "${SSH_PORT}" != "22" ]]; then
+    ufw delete allow 22/tcp || true
+    ufw delete limit 22/tcp || true
+  fi
+}
+
+configure_ufw_icmp() {
+  log "Отключаю ICMP в /etc/ufw/before.rules"
+  backup_file "$UFW_BEFORE"
+
+  awk '
+  BEGIN {done=0}
+  {
+    if ($0 ~ /^# ok icmp codes for INPUT/ && done==0) {
+      print "# ok icmp codes for INPUT"
+      print "-A ufw-before-input -p icmp --icmp-type destination-unreachable -j DROP"
+      print "-A ufw-before-input -p icmp --icmp-type time-exceeded -j DROP"
+      print "-A ufw-before-input -p icmp --icmp-type parameter-problem -j DROP"
+      print "-A ufw-before-input -p icmp --icmp-type echo-request -j DROP"
+      print "-A ufw-before-input -p icmp --icmp-type source-quench -j DROP"
+      print ""
+      print "# ok icmp code for FORWARD"
+      print "-A ufw-before-forward -p icmp --icmp-type destination-unreachable -j DROP"
+      print "-A ufw-before-forward -p icmp --icmp-type time-exceeded -j DROP"
+      print "-A ufw-before-forward -p icmp --icmp-type parameter-problem -j DROP"
+      print "-A ufw-before-forward -p icmp --icmp-type echo-request -j DROP"
+      done=1
+
+      skip=1
+      next
+    }
+
+    if (skip==1) {
+      if ($0 ~ /^# ok icmp code for FORWARD/) next
+      if ($0 ~ /^-A ufw-before-input -p icmp/) next
+      if ($0 ~ /^-A ufw-before-forward -p icmp/) next
+      if ($0 ~ /^$/) { skip=0; next }
+      skip=0
+    }
+
+    print
+  }' "$UFW_BEFORE" > "${UFW_BEFORE}.tmp"
+
+  mv "${UFW_BEFORE}.tmp" "$UFW_BEFORE"
+}
+
+enable_ufw() {
+  log "Перезапускаю UFW"
+  ufw disable || true
+  ufw --force enable
+  ufw status verbose
+}
+
+verify_ssh_port() {
+  log "Проверяю, что SSH слушает новый порт"
+  ss -tlnp | grep -E "LISTEN.+:${SSH_PORT}\b" || die "SSH не слушает порт ${SSH_PORT}"
+  echo "Порт SSH установлен ${SSH_PORT}"
+}
+
+upgrade_kernel_and_reboot() {
+  log "Обновляю ядро до linux-generic-hwe-24.04"
+  apt update
+  apt install -y linux-generic-hwe-24.04
+  apt remove -y linux-image-generic || true
+  apt autoremove -y --purge
+
+  log "Готово. Сервер будет перезагружен через 5 секунд"
+  sleep 5
+  reboot
+}
+
+main() {
+  require_root
+  check_authorized_keys
+  prompt_ssh_port
+  apt_update_upgrade
+  install_base_utils
+  install_docker_official
+  install_nginx_optional
+  install_iperf3
+  configure_ufw_ipv6
+  configure_ssh
+  configure_ufw_rules
+  configure_ufw_icmp
+  enable_ufw
+  verify_ssh_port
+  upgrade_kernel_and_reboot
+}
+
+main "$@"
